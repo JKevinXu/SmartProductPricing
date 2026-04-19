@@ -89,8 +89,12 @@ python3 -m src.shopee_baseline \
   --output-path data/submissions/shopee_submission.csv
 ```
 
-The baseline combines exact `image_phash` groups with title TF-IDF nearest
-neighbors, and writes capped local F1 diagnostics to
+The baseline combines exact `image_phash` groups with character and word-level
+title TF-IDF nearest neighbors, and writes capped local F1 diagnostics to
 `reports/shopee_baseline_report.json` when `label_group` is available. Use
 `--diagnostics-limit 0` to skip diagnostics or a larger value for a slower,
 broader local check.
+
+The local script also has an opt-in handcrafted image-vector experiment through
+`--image-embeddings`. That experiment scored worse on Kaggle than the text and
+pHash baseline, so the submitted kernel leaves it disabled.

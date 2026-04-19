@@ -13,9 +13,12 @@ LOCAL_INPUT_DIR = Path("data/shopee/raw")
 INPUT_DIR = KAGGLE_INPUT_DIR if KAGGLE_INPUT_DIR.exists() else LOCAL_INPUT_DIR
 OUTPUT_PATH = Path("/kaggle/working/submission.csv") if Path("/kaggle/working").exists() else Path("data/submissions/shopee_kernel_submission.csv")
 
-TITLE_THRESHOLD = 0.72
-MAX_FEATURES = 100000
-MAX_TITLE_NEIGHBORS = 80
+CHAR_TITLE_THRESHOLD = 0.72
+WORD_TITLE_THRESHOLD = 0.66
+MAX_CHAR_FEATURES = 100000
+MAX_WORD_FEATURES = 100000
+MAX_CHAR_TITLE_NEIGHBORS = 80
+MAX_WORD_TITLE_NEIGHBORS = 80
 
 PUBLIC_TEST_FALLBACK = pd.DataFrame(
     {
@@ -65,18 +68,32 @@ def exact_phash_matches(frame: pd.DataFrame) -> dict[str, set[str]]:
     }
 
 
-def title_neighbor_matches(frame: pd.DataFrame) -> dict[str, set[str]]:
+def tfidf_neighbor_matches(
+    frame: pd.DataFrame,
+    *,
+    analyzer: str,
+    ngram_range: tuple[int, int],
+    threshold: float,
+    max_features: int,
+    max_neighbors: int,
+) -> dict[str, set[str]]:
     titles = normalize_titles(frame["title"])
+    vectorizer_args = {
+        "analyzer": analyzer,
+        "ngram_range": ngram_range,
+        "min_df": 1,
+        "max_features": max_features,
+        "lowercase": False,
+        "dtype": np.float32,
+    }
+    if analyzer == "word":
+        vectorizer_args["token_pattern"] = r"(?u)\b\w+\b"
+
     vectorizer = TfidfVectorizer(
-        analyzer="char_wb",
-        ngram_range=(3, 5),
-        min_df=1,
-        max_features=MAX_FEATURES,
-        lowercase=False,
-        dtype=np.float32,
+        **vectorizer_args,
     )
     title_matrix = vectorizer.fit_transform(titles)
-    neighbor_count = min(MAX_TITLE_NEIGHBORS, len(frame))
+    neighbor_count = min(max_neighbors, len(frame))
     model = NearestNeighbors(
         n_neighbors=neighbor_count,
         metric="cosine",
@@ -92,10 +109,32 @@ def title_neighbor_matches(frame: pd.DataFrame) -> dict[str, set[str]]:
         row_matches = {posting_id}
         similarities = 1.0 - distances[row_index]
         for similarity, neighbor_index in zip(similarities, indices[row_index], strict=False):
-            if similarity >= TITLE_THRESHOLD:
+            if similarity >= threshold:
                 row_matches.add(str(posting_ids[neighbor_index]))
         matches[str(posting_id)] = row_matches
     return matches
+
+
+def char_title_matches(frame: pd.DataFrame) -> dict[str, set[str]]:
+    return tfidf_neighbor_matches(
+        frame,
+        analyzer="char_wb",
+        ngram_range=(3, 5),
+        threshold=CHAR_TITLE_THRESHOLD,
+        max_features=MAX_CHAR_FEATURES,
+        max_neighbors=MAX_CHAR_TITLE_NEIGHBORS,
+    )
+
+
+def word_title_matches(frame: pd.DataFrame) -> dict[str, set[str]]:
+    return tfidf_neighbor_matches(
+        frame,
+        analyzer="word",
+        ngram_range=(1, 2),
+        threshold=WORD_TITLE_THRESHOLD,
+        max_features=MAX_WORD_FEATURES,
+        max_neighbors=MAX_WORD_TITLE_NEIGHBORS,
+    )
 
 
 def combine_matches(*match_maps: dict[str, set[str]]) -> dict[str, set[str]]:
@@ -130,10 +169,10 @@ def main() -> None:
     else:
         print(f"Using test CSV: {test_path}")
         test = pd.read_csv(test_path)
-
     predictions = combine_matches(
         exact_phash_matches(test),
-        title_neighbor_matches(test),
+        char_title_matches(test),
+        word_title_matches(test),
     )
     submission = pd.DataFrame(
         {
