@@ -99,13 +99,15 @@ The local script also has an opt-in handcrafted image-vector experiment through
 `--image-embeddings`. That experiment scored worse on Kaggle than the text and
 pHash baseline, so the submitted kernel leaves it disabled.
 
-The next image experiment uses offline ResNet18 weights attached to the Kaggle
-kernel as `kevinxuj/shopee-resnet18-weights`. Locally, enable it with:
+The next image experiment uses offline CLIP ViT-B/32 weights attached to the
+Kaggle kernel as `kevinxuj/shopee-clip-vit-b32-weights`. Locally, enable it
+with:
 
 ```bash
 python3 -m src.shopee_baseline \
   --train-csv data/shopee/raw/train.csv \
   --test-csv data/shopee/raw/test.csv \
   --pretrained-image-embeddings \
-  --pretrained-weights-path data/shopee/raw/resnet18-weights/resnet18-f37072fd.pth
+  --pretrained-model clip_vit_b32 \
+  --pretrained-weights-path data/shopee/raw/clip-vit-b32-weights/ViT-B-32.pt
 ```

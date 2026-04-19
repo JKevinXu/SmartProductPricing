@@ -21,11 +21,12 @@ MAX_WORD_FEATURES = 100000
 MAX_CHAR_TITLE_NEIGHBORS = 80
 MAX_WORD_TITLE_NEIGHBORS = 80
 USE_PRETRAINED_IMAGE_EMBEDDINGS = True
-PRETRAINED_IMAGE_THRESHOLD = 0.85
+PRETRAINED_MODEL = "clip_vit_b32"
+PRETRAINED_IMAGE_THRESHOLD = 0.75
 MAX_PRETRAINED_IMAGE_NEIGHBORS = 80
 PRETRAINED_IMAGE_SIZE = 224
-PRETRAINED_BATCH_SIZE = 96
-PRETRAINED_WEIGHTS_FILE = "resnet18-f37072fd.pth"
+PRETRAINED_BATCH_SIZE = 64
+PRETRAINED_WEIGHTS_FILE = "ViT-B-32.pt"
 
 PUBLIC_TEST_FALLBACK = pd.DataFrame(
     {
@@ -163,8 +164,8 @@ def find_image_dir(test_path: Path | None) -> Path | None:
 
 def find_pretrained_weights() -> Path | None:
     candidates = [
-        Path("/kaggle/input/shopee-resnet18-weights") / PRETRAINED_WEIGHTS_FILE,
-        LOCAL_INPUT_DIR / "resnet18-weights" / PRETRAINED_WEIGHTS_FILE,
+        Path("/kaggle/input/shopee-clip-vit-b32-weights") / PRETRAINED_WEIGHTS_FILE,
+        LOCAL_INPUT_DIR / "clip-vit-b32-weights" / PRETRAINED_WEIGHTS_FILE,
     ]
     input_root = Path("/kaggle/input")
     if input_root.exists():
@@ -239,6 +240,70 @@ def resnet18_image_embeddings(frame: pd.DataFrame, image_dir: Path, weights_path
     return embeddings
 
 
+def load_clip_feature_model(weights_path: Path):
+    import torch
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type != "cuda":
+        raise RuntimeError("CLIP JIT weights require a CUDA runtime in this kernel")
+    model = torch.jit.load(str(weights_path), map_location=device).eval()
+    return model, device
+
+
+def clip_image_tensor(image_path: Path):
+    import torch
+
+    try:
+        with Image.open(image_path) as image:
+            image = ImageOps.exif_transpose(image).convert("RGB")
+            image = ImageOps.fit(
+                image,
+                (PRETRAINED_IMAGE_SIZE, PRETRAINED_IMAGE_SIZE),
+                method=Image.Resampling.BICUBIC,
+                centering=(0.5, 0.5),
+            )
+    except Exception:
+        return None
+
+    pixels = np.asarray(image, dtype=np.float32) / 255.0
+    pixels = (pixels - np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)) / np.array(
+        [0.26862954, 0.26130258, 0.27577711],
+        dtype=np.float32,
+    )
+    return torch.from_numpy(pixels).permute(2, 0, 1)
+
+
+def clip_image_embeddings(frame: pd.DataFrame, image_dir: Path, weights_path: Path) -> np.ndarray:
+    import torch
+
+    model, device = load_clip_feature_model(weights_path)
+    embeddings = np.zeros((len(frame), 512), dtype=np.float32)
+    batch_tensors = []
+    batch_indices = []
+
+    def flush_batch() -> None:
+        if not batch_tensors:
+            return
+        batch = torch.stack(batch_tensors).to(device)
+        with torch.no_grad():
+            features = model.encode_image(batch).float()
+            features = features / features.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        embeddings[batch_indices] = features.cpu().numpy().astype(np.float32)
+        batch_tensors.clear()
+        batch_indices.clear()
+
+    for row_index, image_name in enumerate(frame["image"].fillna("")):
+        tensor = clip_image_tensor(image_dir / str(image_name))
+        if tensor is None:
+            continue
+        batch_tensors.append(tensor)
+        batch_indices.append(row_index)
+        if len(batch_tensors) >= PRETRAINED_BATCH_SIZE:
+            flush_batch()
+    flush_batch()
+    return embeddings
+
+
 def pretrained_image_matches(
     frame: pd.DataFrame,
     image_dir: Path | None,
@@ -251,7 +316,12 @@ def pretrained_image_matches(
         return {str(posting_id): {str(posting_id)} for posting_id in frame["posting_id"]}
 
     try:
-        embeddings = resnet18_image_embeddings(frame, image_dir, weights_path)
+        if PRETRAINED_MODEL == "clip_vit_b32":
+            embeddings = clip_image_embeddings(frame, image_dir, weights_path)
+        elif PRETRAINED_MODEL == "resnet18":
+            embeddings = resnet18_image_embeddings(frame, image_dir, weights_path)
+        else:
+            raise ValueError(f"Unknown pretrained model: {PRETRAINED_MODEL}")
     except Exception as exc:
         print(f"Skipping pretrained image embeddings after error: {exc}")
         return {str(posting_id): {str(posting_id)} for posting_id in frame["posting_id"]}

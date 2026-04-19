@@ -46,6 +46,7 @@ class ShopeeConfig:
     image_threshold: float
     max_image_neighbors: int
     use_pretrained_image_embeddings: bool
+    pretrained_model: str
     pretrained_weights_path: str | None
     pretrained_image_size: int
     pretrained_image_threshold: float
@@ -86,9 +87,10 @@ def parse_args() -> ShopeeConfig:
         action="store_true",
         dest="use_pretrained_image_embeddings",
     )
+    parser.add_argument("--pretrained-model", choices=["clip_vit_b32", "resnet18"], default="clip_vit_b32")
     parser.add_argument("--pretrained-weights-path", default=None)
     parser.add_argument("--pretrained-image-size", type=int, default=224)
-    parser.add_argument("--pretrained-image-threshold", type=float, default=0.85)
+    parser.add_argument("--pretrained-image-threshold", type=float, default=0.75)
     parser.add_argument("--max-pretrained-image-neighbors", type=int, default=80)
     parser.add_argument("--pretrained-batch-size", type=int, default=64)
     args = parser.parse_args()
@@ -347,6 +349,97 @@ def resnet18_image_embeddings(
     return embeddings
 
 
+def load_clip_feature_model(weights_path: Path):
+    import torch
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        model = torch.jit.load(str(weights_path), map_location=device).eval()
+
+        def encode(batch):
+            return model.encode_image(batch)
+
+        return encode, device
+
+    try:
+        import clip
+    except ImportError as exc:
+        raise RuntimeError("CPU CLIP diagnostics require the openai-clip package") from exc
+
+    model, _ = clip.load(
+        "ViT-B/32",
+        device=device,
+        jit=False,
+        download_root=str(weights_path.parent),
+    )
+    model.eval()
+
+    def encode(batch):
+        return model.encode_image(batch)
+
+    return encode, device
+
+
+def clip_image_tensor(image_path: Path, image_size: int):
+    import torch
+
+    try:
+        with Image.open(image_path) as image:
+            image = ImageOps.exif_transpose(image).convert("RGB")
+            image = ImageOps.fit(
+                image,
+                (image_size, image_size),
+                method=Image.Resampling.BICUBIC,
+                centering=(0.5, 0.5),
+            )
+    except Exception:
+        return None
+
+    pixels = np.asarray(image, dtype=np.float32) / 255.0
+    pixels = (pixels - np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)) / np.array(
+        [0.26862954, 0.26130258, 0.27577711],
+        dtype=np.float32,
+    )
+    return torch.from_numpy(pixels).permute(2, 0, 1)
+
+
+def clip_image_embeddings(
+    frame: pd.DataFrame,
+    image_dir: Path,
+    weights_path: Path,
+    image_size: int,
+    batch_size: int,
+) -> np.ndarray:
+    import torch
+
+    encode, device = load_clip_feature_model(weights_path)
+    embeddings = np.zeros((len(frame), 512), dtype=np.float32)
+    batch_tensors = []
+    batch_indices = []
+
+    def flush_batch() -> None:
+        if not batch_tensors:
+            return
+        batch = torch.stack(batch_tensors).to(device)
+        with torch.no_grad():
+            features = encode(batch).float()
+            features = features / features.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        embeddings[batch_indices] = features.cpu().numpy().astype(np.float32)
+        batch_tensors.clear()
+        batch_indices.clear()
+
+    for row_index, image_name in enumerate(frame["image"].fillna("")):
+        tensor = clip_image_tensor(image_dir / str(image_name), image_size)
+        if tensor is None:
+            continue
+        batch_tensors.append(tensor)
+        batch_indices.append(row_index)
+        if len(batch_tensors) >= batch_size:
+            flush_batch()
+    flush_batch()
+    return embeddings
+
+
 def pretrained_image_neighbor_matches(
     frame: pd.DataFrame,
     image_dir: Path | None,
@@ -358,13 +451,24 @@ def pretrained_image_neighbor_matches(
     if not weights_path.exists():
         return {str(posting_id): {str(posting_id)} for posting_id in frame["posting_id"]}
 
-    embeddings = resnet18_image_embeddings(
-        frame,
-        image_dir,
-        weights_path,
-        config.pretrained_image_size,
-        config.pretrained_batch_size,
-    )
+    if config.pretrained_model == "clip_vit_b32":
+        embeddings = clip_image_embeddings(
+            frame,
+            image_dir,
+            weights_path,
+            config.pretrained_image_size,
+            config.pretrained_batch_size,
+        )
+    elif config.pretrained_model == "resnet18":
+        embeddings = resnet18_image_embeddings(
+            frame,
+            image_dir,
+            weights_path,
+            config.pretrained_image_size,
+            config.pretrained_batch_size,
+        )
+    else:
+        raise ValueError(f"Unknown pretrained model: {config.pretrained_model}")
     valid = np.linalg.norm(embeddings, axis=1) > 0
     neighbor_count = min(config.max_pretrained_image_neighbors, len(frame))
     model = NearestNeighbors(

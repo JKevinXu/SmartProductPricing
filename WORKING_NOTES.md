@@ -188,10 +188,9 @@ writes:
 
 Best next steps for better score:
 
-1. Submit the ResNet18 pretrained image-embedding candidate source and compare
-   it with the current best `0.660/0.648` score.
+1. Build a pairwise reranker over pHash, title, and image candidate pairs.
 2. Tune title and image thresholds on full local train F1 and public score.
-3. Add a stronger reranker over the combined candidate set.
+3. Add multilingual text embeddings for semantic title similarity.
 4. Use multilingual text embeddings for Indonesian/English title similarity.
 5. Train a Siamese or metric-learning model from `label_group` pairs.
 6. Build a candidate set from many weak signals, then tune per-signal thresholds
@@ -231,3 +230,38 @@ privateScore: 0.648
 
 This means ResNet18 did not hurt, but it also did not improve the leaderboard
 score over the lighter pHash + character TF-IDF + word TF-IDF baseline.
+
+## CLIP ViT-B/32 Image Candidate
+
+The CLIP experiment uses a private Kaggle dataset for offline OpenAI CLIP JIT
+weights:
+
+```text
+dataset: kevinxuj/shopee-clip-vit-b32-weights
+file:    ViT-B-32.pt
+```
+
+The kernel enables GPU because the OpenAI JIT graph expects CUDA. If CLIP
+loading fails, the kernel falls back to the current pHash + character TF-IDF +
+word TF-IDF baseline.
+
+Small local sanity grid on a 79-row downloaded image subset:
+
+```text
+text+pHash baseline mean_f1:         0.821
+CLIP threshold 0.75 mean_f1:         0.905
+mean match count at 0.75:            2.34
+```
+
+Kaggle scored the CLIP submission as another tie with the current best:
+
+```text
+description: phash title tfidf clip vit b32 image baseline
+status:      COMPLETE
+publicScore: 0.660
+privateScore: 0.648
+```
+
+CLIP was stronger than ResNet18 on the small local image subset, but it did not
+move the leaderboard score. The next step should shift from adding raw neighbor
+sources to ranking candidate pairs more carefully.

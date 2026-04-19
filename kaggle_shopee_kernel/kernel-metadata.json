@@ -9,7 +9,7 @@
   "enable_tpu": "false",
   "enable_internet": "false",
   "dataset_sources": [
-    "kevinxuj/shopee-resnet18-weights"
+    "kevinxuj/shopee-clip-vit-b32-weights"
   ],
   "competition_sources": [
     "shopee-product-matching"
