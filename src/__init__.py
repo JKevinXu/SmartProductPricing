@@ -1,0 +1,1 @@
+"""SmartProductPricing training package."""
