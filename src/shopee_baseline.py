@@ -2,8 +2,8 @@
 
 The competition asks for a space-separated list of matching `posting_id`
 values for every test row. This baseline combines exact image perceptual hash
-matches with character and word title TF-IDF nearest neighbors. Lightweight
-image embeddings are available as an opt-in experiment.
+matches with character and word title TF-IDF nearest neighbors. Image features
+are available as opt-in candidate sources.
 """
 
 from __future__ import annotations
@@ -45,6 +45,12 @@ class ShopeeConfig:
     image_size: int
     image_threshold: float
     max_image_neighbors: int
+    use_pretrained_image_embeddings: bool
+    pretrained_weights_path: str | None
+    pretrained_image_size: int
+    pretrained_image_threshold: float
+    max_pretrained_image_neighbors: int
+    pretrained_batch_size: int
 
 
 def parse_args() -> ShopeeConfig:
@@ -75,6 +81,16 @@ def parse_args() -> ShopeeConfig:
     parser.add_argument("--image-size", type=int, default=16)
     parser.add_argument("--image-threshold", type=float, default=0.985)
     parser.add_argument("--max-image-neighbors", type=int, default=80)
+    parser.add_argument(
+        "--pretrained-image-embeddings",
+        action="store_true",
+        dest="use_pretrained_image_embeddings",
+    )
+    parser.add_argument("--pretrained-weights-path", default=None)
+    parser.add_argument("--pretrained-image-size", type=int, default=224)
+    parser.add_argument("--pretrained-image-threshold", type=float, default=0.85)
+    parser.add_argument("--max-pretrained-image-neighbors", type=int, default=80)
+    parser.add_argument("--pretrained-batch-size", type=int, default=64)
     args = parser.parse_args()
     values = vars(args)
     values["use_word_title"] = not values.pop("no_word_title")
@@ -261,6 +277,118 @@ def image_neighbor_matches(
     return matches
 
 
+def load_resnet18_feature_model(weights_path: Path):
+    import torch
+    from torch import nn
+    from torchvision.models import resnet18
+
+    model = resnet18(weights=None)
+    state = torch.load(weights_path, map_location="cpu")
+    model.load_state_dict(state)
+    feature_model = nn.Sequential(*list(model.children())[:-1])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    feature_model.to(device)
+    feature_model.eval()
+    return feature_model, device
+
+
+def resnet18_image_tensor(image_path: Path, image_size: int):
+    import torch
+
+    try:
+        with Image.open(image_path) as image:
+            image = ImageOps.exif_transpose(image).convert("RGB")
+            image = image.resize((image_size, image_size), Image.Resampling.BILINEAR)
+    except Exception:
+        return None
+
+    pixels = np.asarray(image, dtype=np.float32) / 255.0
+    pixels = (pixels - np.array([0.485, 0.456, 0.406], dtype=np.float32)) / np.array(
+        [0.229, 0.224, 0.225],
+        dtype=np.float32,
+    )
+    return torch.from_numpy(pixels).permute(2, 0, 1)
+
+
+def resnet18_image_embeddings(
+    frame: pd.DataFrame,
+    image_dir: Path,
+    weights_path: Path,
+    image_size: int,
+    batch_size: int,
+) -> np.ndarray:
+    import torch
+
+    model, device = load_resnet18_feature_model(weights_path)
+    embeddings = np.zeros((len(frame), 512), dtype=np.float32)
+    batch_tensors = []
+    batch_indices = []
+
+    def flush_batch() -> None:
+        if not batch_tensors:
+            return
+        batch = torch.stack(batch_tensors).to(device)
+        with torch.no_grad():
+            features = model(batch).flatten(1)
+            features = features / features.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        embeddings[batch_indices] = features.cpu().numpy().astype(np.float32)
+        batch_tensors.clear()
+        batch_indices.clear()
+
+    for row_index, image_name in enumerate(frame["image"].fillna("")):
+        tensor = resnet18_image_tensor(image_dir / str(image_name), image_size)
+        if tensor is None:
+            continue
+        batch_tensors.append(tensor)
+        batch_indices.append(row_index)
+        if len(batch_tensors) >= batch_size:
+            flush_batch()
+    flush_batch()
+    return embeddings
+
+
+def pretrained_image_neighbor_matches(
+    frame: pd.DataFrame,
+    image_dir: Path | None,
+    weights_path: Path | None,
+    config: ShopeeConfig,
+) -> dict[str, set[str]]:
+    if image_dir is None or weights_path is None or "image" not in frame.columns:
+        return {str(posting_id): {str(posting_id)} for posting_id in frame["posting_id"]}
+    if not weights_path.exists():
+        return {str(posting_id): {str(posting_id)} for posting_id in frame["posting_id"]}
+
+    embeddings = resnet18_image_embeddings(
+        frame,
+        image_dir,
+        weights_path,
+        config.pretrained_image_size,
+        config.pretrained_batch_size,
+    )
+    valid = np.linalg.norm(embeddings, axis=1) > 0
+    neighbor_count = min(config.max_pretrained_image_neighbors, len(frame))
+    model = NearestNeighbors(
+        n_neighbors=neighbor_count,
+        metric="cosine",
+        algorithm="brute",
+        n_jobs=-1,
+    )
+    model.fit(embeddings)
+    distances, indices = model.kneighbors(embeddings, return_distance=True)
+
+    posting_ids = frame["posting_id"].astype(str).to_numpy()
+    matches: dict[str, set[str]] = {}
+    for row_index, posting_id in enumerate(posting_ids):
+        row_matches = {posting_id}
+        if valid[row_index]:
+            similarities = 1.0 - distances[row_index]
+            for similarity, neighbor_index in zip(similarities, indices[row_index], strict=False):
+                if valid[neighbor_index] and similarity >= config.pretrained_image_threshold:
+                    row_matches.add(str(posting_ids[neighbor_index]))
+        matches[str(posting_id)] = row_matches
+    return matches
+
+
 def combine_matches(*match_maps: dict[str, set[str]]) -> dict[str, set[str]]:
     combined: dict[str, set[str]] = {}
     for match_map in match_maps:
@@ -337,8 +465,15 @@ def main() -> None:
     test_image_dir = resolve_image_dir(test_path, config.test_image_dir, "test_images")
 
     print(f"Loaded train rows={len(train)} test rows={len(test)}")
-    if config.use_image_embeddings:
+    if config.use_image_embeddings or config.use_pretrained_image_embeddings:
         print(f"Train image dir={train_image_dir} test image dir={test_image_dir}")
+    pretrained_weights_path = (
+        Path(config.pretrained_weights_path)
+        if config.pretrained_weights_path
+        else None
+    )
+    if config.use_pretrained_image_embeddings:
+        print(f"Pretrained image weights={pretrained_weights_path}")
 
     train_metrics: dict[str, float] = {}
     if "label_group" in train.columns and config.diagnostics_limit != 0:
@@ -354,6 +489,15 @@ def main() -> None:
             train_match_maps.append(word_title_neighbor_matches(diagnostic_frame, config))
         if config.use_image_embeddings:
             train_match_maps.append(image_neighbor_matches(diagnostic_frame, train_image_dir, config))
+        if config.use_pretrained_image_embeddings:
+            train_match_maps.append(
+                pretrained_image_neighbor_matches(
+                    diagnostic_frame,
+                    train_image_dir,
+                    pretrained_weights_path,
+                    config,
+                )
+            )
         train_predictions = combine_matches(*train_match_maps)
         train_metrics = evaluate_matches(diagnostic_frame, train_predictions)
     else:
@@ -374,6 +518,15 @@ def main() -> None:
         test_match_maps.append(word_title_neighbor_matches(test, config))
     if config.use_image_embeddings:
         test_match_maps.append(image_neighbor_matches(test, test_image_dir, config))
+    if config.use_pretrained_image_embeddings:
+        test_match_maps.append(
+            pretrained_image_neighbor_matches(
+                test,
+                test_image_dir,
+                pretrained_weights_path,
+                config,
+            )
+        )
     test_predictions = combine_matches(*test_match_maps)
     submission = format_submission(test, test_predictions)
     submission.to_csv(output_path, index=False)

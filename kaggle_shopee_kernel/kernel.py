@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from PIL import Image, ImageOps
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.neighbors import NearestNeighbors
 
@@ -19,6 +20,12 @@ MAX_CHAR_FEATURES = 100000
 MAX_WORD_FEATURES = 100000
 MAX_CHAR_TITLE_NEIGHBORS = 80
 MAX_WORD_TITLE_NEIGHBORS = 80
+USE_PRETRAINED_IMAGE_EMBEDDINGS = True
+PRETRAINED_IMAGE_THRESHOLD = 0.85
+MAX_PRETRAINED_IMAGE_NEIGHBORS = 80
+PRETRAINED_IMAGE_SIZE = 224
+PRETRAINED_BATCH_SIZE = 96
+PRETRAINED_WEIGHTS_FILE = "resnet18-f37072fd.pth"
 
 PUBLIC_TEST_FALLBACK = pd.DataFrame(
     {
@@ -137,6 +144,142 @@ def word_title_matches(frame: pd.DataFrame) -> dict[str, set[str]]:
     )
 
 
+def find_image_dir(test_path: Path | None) -> Path | None:
+    candidates = []
+    if test_path is not None:
+        candidates.append(test_path.parent / "test_images")
+    candidates.extend(
+        [
+            INPUT_DIR / "test_images",
+            Path("/kaggle/input/competitions/shopee-product-matching/test_images"),
+            LOCAL_INPUT_DIR / "test_images",
+        ]
+    )
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+    return None
+
+
+def find_pretrained_weights() -> Path | None:
+    candidates = [
+        Path("/kaggle/input/shopee-resnet18-weights") / PRETRAINED_WEIGHTS_FILE,
+        LOCAL_INPUT_DIR / "resnet18-weights" / PRETRAINED_WEIGHTS_FILE,
+    ]
+    input_root = Path("/kaggle/input")
+    if input_root.exists():
+        candidates.extend(input_root.rglob(PRETRAINED_WEIGHTS_FILE))
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
+def load_resnet18_feature_model(weights_path: Path):
+    import torch
+    from torch import nn
+    from torchvision.models import resnet18
+
+    model = resnet18(weights=None)
+    state = torch.load(weights_path, map_location="cpu")
+    model.load_state_dict(state)
+    feature_model = nn.Sequential(*list(model.children())[:-1])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    feature_model.to(device)
+    feature_model.eval()
+    return feature_model, device
+
+
+def resnet18_image_tensor(image_path: Path):
+    import torch
+
+    try:
+        with Image.open(image_path) as image:
+            image = ImageOps.exif_transpose(image).convert("RGB")
+            image = image.resize((PRETRAINED_IMAGE_SIZE, PRETRAINED_IMAGE_SIZE), Image.Resampling.BILINEAR)
+    except Exception:
+        return None
+
+    pixels = np.asarray(image, dtype=np.float32) / 255.0
+    pixels = (pixels - np.array([0.485, 0.456, 0.406], dtype=np.float32)) / np.array(
+        [0.229, 0.224, 0.225],
+        dtype=np.float32,
+    )
+    return torch.from_numpy(pixels).permute(2, 0, 1)
+
+
+def resnet18_image_embeddings(frame: pd.DataFrame, image_dir: Path, weights_path: Path) -> np.ndarray:
+    import torch
+
+    model, device = load_resnet18_feature_model(weights_path)
+    embeddings = np.zeros((len(frame), 512), dtype=np.float32)
+    batch_tensors = []
+    batch_indices = []
+
+    def flush_batch() -> None:
+        if not batch_tensors:
+            return
+        batch = torch.stack(batch_tensors).to(device)
+        with torch.no_grad():
+            features = model(batch).flatten(1)
+            features = features / features.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        embeddings[batch_indices] = features.cpu().numpy().astype(np.float32)
+        batch_tensors.clear()
+        batch_indices.clear()
+
+    for row_index, image_name in enumerate(frame["image"].fillna("")):
+        tensor = resnet18_image_tensor(image_dir / str(image_name))
+        if tensor is None:
+            continue
+        batch_tensors.append(tensor)
+        batch_indices.append(row_index)
+        if len(batch_tensors) >= PRETRAINED_BATCH_SIZE:
+            flush_batch()
+    flush_batch()
+    return embeddings
+
+
+def pretrained_image_matches(
+    frame: pd.DataFrame,
+    image_dir: Path | None,
+    weights_path: Path | None,
+) -> dict[str, set[str]]:
+    if not USE_PRETRAINED_IMAGE_EMBEDDINGS:
+        return {str(posting_id): {str(posting_id)} for posting_id in frame["posting_id"]}
+    if image_dir is None or weights_path is None or "image" not in frame.columns:
+        print("Skipping pretrained image embeddings; image directory or weights are missing.")
+        return {str(posting_id): {str(posting_id)} for posting_id in frame["posting_id"]}
+
+    try:
+        embeddings = resnet18_image_embeddings(frame, image_dir, weights_path)
+    except Exception as exc:
+        print(f"Skipping pretrained image embeddings after error: {exc}")
+        return {str(posting_id): {str(posting_id)} for posting_id in frame["posting_id"]}
+
+    valid = np.linalg.norm(embeddings, axis=1) > 0
+    neighbor_count = min(MAX_PRETRAINED_IMAGE_NEIGHBORS, len(frame))
+    model = NearestNeighbors(
+        n_neighbors=neighbor_count,
+        metric="cosine",
+        algorithm="brute",
+        n_jobs=-1,
+    )
+    model.fit(embeddings)
+    distances, indices = model.kneighbors(embeddings, return_distance=True)
+
+    posting_ids = frame["posting_id"].astype(str).to_numpy()
+    matches: dict[str, set[str]] = {}
+    for row_index, posting_id in enumerate(posting_ids):
+        row_matches = {posting_id}
+        if valid[row_index]:
+            similarities = 1.0 - distances[row_index]
+            for similarity, neighbor_index in zip(similarities, indices[row_index], strict=False):
+                if valid[neighbor_index] and similarity >= PRETRAINED_IMAGE_THRESHOLD:
+                    row_matches.add(str(posting_ids[neighbor_index]))
+        matches[str(posting_id)] = row_matches
+    return matches
+
+
 def combine_matches(*match_maps: dict[str, set[str]]) -> dict[str, set[str]]:
     combined: dict[str, set[str]] = {}
     for match_map in match_maps:
@@ -169,10 +312,15 @@ def main() -> None:
     else:
         print(f"Using test CSV: {test_path}")
         test = pd.read_csv(test_path)
+    image_dir = find_image_dir(test_path)
+    weights_path = find_pretrained_weights()
+    print(f"Using image dir: {image_dir}")
+    print(f"Using pretrained weights: {weights_path}")
     predictions = combine_matches(
         exact_phash_matches(test),
         char_title_matches(test),
         word_title_matches(test),
+        pretrained_image_matches(test, image_dir, weights_path),
     )
     submission = pd.DataFrame(
         {

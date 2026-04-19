@@ -188,8 +188,9 @@ writes:
 
 Best next steps for better score:
 
-1. Use pretrained image embeddings, such as CLIP, EfficientNet, ViT, or ResNet.
-2. Tune title thresholds on full local train F1 and public score.
+1. Submit the ResNet18 pretrained image-embedding candidate source and compare
+   it with the current best `0.660/0.648` score.
+2. Tune title and image thresholds on full local train F1 and public score.
 3. Add a stronger reranker over the combined candidate set.
 4. Use multilingual text embeddings for Indonesian/English title similarity.
 5. Train a Siamese or metric-learning model from `label_group` pairs.
@@ -198,3 +199,35 @@ Best next steps for better score:
 
 The biggest expected jump should come from real pretrained image embeddings,
 not from the current handcrafted image vector.
+
+## ResNet18 Image Candidate
+
+The ResNet18 experiment uses a private Kaggle dataset for offline weights:
+
+```text
+dataset: kevinxuj/shopee-resnet18-weights
+file:    resnet18-f37072fd.pth
+```
+
+The submitted kernel enables GPU and falls back to the current text+pHash
+baseline if the weights or test images are unavailable.
+
+Small local sanity grid on a 64-row downloaded image subset:
+
+```text
+text+pHash baseline mean_f1:      0.770
+ResNet18 threshold 0.85 mean_f1:  0.853
+mean match count at 0.85:         2.19
+```
+
+Kaggle scored the ResNet18 submission as a tie with the current best:
+
+```text
+description: phash title tfidf resnet18 image baseline
+status:      COMPLETE
+publicScore: 0.660
+privateScore: 0.648
+```
+
+This means ResNet18 did not hurt, but it also did not improve the leaderboard
+score over the lighter pHash + character TF-IDF + word TF-IDF baseline.
