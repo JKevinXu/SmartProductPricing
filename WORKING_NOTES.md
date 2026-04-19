@@ -188,9 +188,9 @@ writes:
 
 Best next steps for better score:
 
-1. Build a pairwise reranker over pHash, title, and image candidate pairs.
-2. Tune title and image thresholds on full local train F1 and public score.
-3. Add multilingual text embeddings for semantic title similarity.
+1. Tune title thresholds on full local train F1 and public score.
+2. Add multilingual text embeddings for semantic title similarity.
+3. Revisit reranking only with a validation design that better matches hidden test behavior.
 4. Use multilingual text embeddings for Indonesian/English title similarity.
 5. Train a Siamese or metric-learning model from `label_group` pairs.
 6. Build a candidate set from many weak signals, then tune per-signal thresholds
@@ -265,3 +265,48 @@ privateScore: 0.648
 CLIP was stronger than ResNet18 on the small local image subset, but it did not
 move the leaderboard score. The next step should shift from adding raw neighbor
 sources to ranking candidate pairs more carefully.
+
+## Pairwise Reranker
+
+The reranker trains a logistic regression model inside the Kaggle kernel using
+`train.csv` label groups. Candidate pairs come from exact pHash groups plus
+looser character and word TF-IDF nearest neighbors.
+
+Pair features:
+
+```text
+same pHash
+character TF-IDF cosine
+word TF-IDF cosine
+max title cosine
+title token Jaccard
+title length ratio
+shared number-token Jaccard
+candidate source flags
+```
+
+The submitted reranker threshold is `0.30`. A local group-level validation
+split improved from `0.755` mean F1 for the union baseline to `0.869` mean F1
+with the reranker.
+
+Kaggle scored the reranker much worse than the current best:
+
+```text
+description: phash title tfidf pairwise reranker
+status:      COMPLETE
+publicScore: 0.508
+privateScore: 0.504
+```
+
+The reranker is now disabled by default in the kernel. The active safe path is
+back to exact pHash + character TF-IDF + word TF-IDF, whose best score remains
+`0.660/0.648`.
+
+The safe baseline was pushed again as kernel version 8 and rescored:
+
+```text
+description: restore phash char word tfidf baseline
+status:      COMPLETE
+publicScore: 0.660
+privateScore: 0.648
+```

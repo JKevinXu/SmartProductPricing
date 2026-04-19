@@ -5,12 +5,10 @@
   "language": "python",
   "kernel_type": "script",
   "is_private": "true",
-  "enable_gpu": "true",
+  "enable_gpu": "false",
   "enable_tpu": "false",
   "enable_internet": "false",
-  "dataset_sources": [
-    "kevinxuj/shopee-clip-vit-b32-weights"
-  ],
+  "dataset_sources": [],
   "competition_sources": [
     "shopee-product-matching"
   ],
