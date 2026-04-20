@@ -95,6 +95,11 @@ title TF-IDF nearest neighbors, and writes capped local F1 diagnostics to
 `--diagnostics-limit 0` to skip diagnostics or a larger value for a slower,
 broader local check.
 
+The script also has an optional published-solution `min2` fallback through
+`--min2-fallback`: when a product still only matches itself after the safe
+union, the script adds its closest title neighbor. It is disabled by default
+because local diagnostics did not improve over the current scored baseline.
+
 The local script also has an opt-in handcrafted image-vector experiment through
 `--image-embeddings`. That experiment scored worse on Kaggle than the text and
 pHash baseline, so the submitted kernel leaves it disabled.

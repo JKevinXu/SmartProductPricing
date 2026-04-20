@@ -37,6 +37,8 @@ class ShopeeConfig:
     word_title_threshold: float
     max_word_features: int
     max_word_title_neighbors: int
+    use_min2_fallback: bool
+    min2_min_similarity: float
     diagnostics_limit: int
     seed: int
     train_image_dir: str | None
@@ -71,6 +73,11 @@ def parse_args() -> ShopeeConfig:
     parser.add_argument("--word-title-threshold", type=float, default=0.66)
     parser.add_argument("--max-word-features", type=int, default=100000)
     parser.add_argument("--max-word-title-neighbors", type=int, default=80)
+    min2_group = parser.add_mutually_exclusive_group()
+    min2_group.add_argument("--min2-fallback", action="store_true", dest="use_min2_fallback")
+    min2_group.add_argument("--no-min2-fallback", action="store_false", dest="use_min2_fallback")
+    parser.set_defaults(use_min2_fallback=False)
+    parser.add_argument("--min2-min-similarity", type=float, default=0.0)
     parser.add_argument("--diagnostics-limit", type=int, default=5000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train-image-dir", default=None)
@@ -142,6 +149,28 @@ def tfidf_neighbor_matches(
     max_neighbors: int,
     min_df: int,
 ) -> dict[str, set[str]]:
+    matches, _ = tfidf_neighbor_matches_with_best(
+        frame,
+        analyzer=analyzer,
+        ngram_range=ngram_range,
+        threshold=threshold,
+        max_features=max_features,
+        max_neighbors=max_neighbors,
+        min_df=min_df,
+    )
+    return matches
+
+
+def tfidf_neighbor_matches_with_best(
+    frame: pd.DataFrame,
+    *,
+    analyzer: str,
+    ngram_range: tuple[int, int],
+    threshold: float,
+    max_features: int,
+    max_neighbors: int,
+    min_df: int,
+) -> tuple[dict[str, set[str]], dict[str, tuple[str, float]]]:
     titles = normalize_titles(frame["title"])
     vectorizer_args = {
         "analyzer": analyzer,
@@ -170,14 +199,18 @@ def tfidf_neighbor_matches(
 
     posting_ids = frame["posting_id"].astype(str).to_numpy()
     matches: dict[str, set[str]] = {}
+    best_neighbors: dict[str, tuple[str, float]] = {}
     for row_index, posting_id in enumerate(posting_ids):
         row_matches = {posting_id}
         similarities = 1.0 - distances[row_index]
         for similarity, neighbor_index in zip(similarities, indices[row_index], strict=False):
+            neighbor_id = str(posting_ids[neighbor_index])
+            if neighbor_index != row_index and str(posting_id) not in best_neighbors:
+                best_neighbors[str(posting_id)] = (neighbor_id, float(similarity))
             if similarity >= threshold:
-                row_matches.add(str(posting_ids[neighbor_index]))
+                row_matches.add(neighbor_id)
         matches[str(posting_id)] = row_matches
-    return matches
+    return matches, best_neighbors
 
 
 def title_neighbor_matches(frame: pd.DataFrame, config: ShopeeConfig) -> dict[str, set[str]]:
@@ -194,6 +227,36 @@ def title_neighbor_matches(frame: pd.DataFrame, config: ShopeeConfig) -> dict[st
 
 def word_title_neighbor_matches(frame: pd.DataFrame, config: ShopeeConfig) -> dict[str, set[str]]:
     return tfidf_neighbor_matches(
+        frame,
+        analyzer="word",
+        ngram_range=(1, 2),
+        threshold=config.word_title_threshold,
+        max_features=config.max_word_features,
+        max_neighbors=config.max_word_title_neighbors,
+        min_df=config.min_df,
+    )
+
+
+def title_neighbor_matches_with_best(
+    frame: pd.DataFrame,
+    config: ShopeeConfig,
+) -> tuple[dict[str, set[str]], dict[str, tuple[str, float]]]:
+    return tfidf_neighbor_matches_with_best(
+        frame,
+        analyzer=config.analyzer,
+        ngram_range=(config.ngram_min, config.ngram_max),
+        threshold=config.title_threshold,
+        max_features=config.max_features,
+        max_neighbors=config.max_title_neighbors,
+        min_df=config.min_df,
+    )
+
+
+def word_title_neighbor_matches_with_best(
+    frame: pd.DataFrame,
+    config: ShopeeConfig,
+) -> tuple[dict[str, set[str]], dict[str, tuple[str, float]]]:
+    return tfidf_neighbor_matches_with_best(
         frame,
         analyzer="word",
         ngram_range=(1, 2),
@@ -501,6 +564,33 @@ def combine_matches(*match_maps: dict[str, set[str]]) -> dict[str, set[str]]:
     return combined
 
 
+def apply_min2_fallback(
+    predictions: dict[str, set[str]],
+    config: ShopeeConfig,
+    *best_neighbor_maps: dict[str, tuple[str, float]],
+) -> dict[str, set[str]]:
+    if not config.use_min2_fallback:
+        return predictions
+
+    updated = {posting_id: set(matches) for posting_id, matches in predictions.items()}
+    for posting_id, matches in updated.items():
+        if len(matches) > 1:
+            continue
+
+        candidates = [
+            neighbor
+            for best_neighbors in best_neighbor_maps
+            if (neighbor := best_neighbors.get(posting_id)) is not None
+        ]
+        if not candidates:
+            continue
+
+        neighbor_id, similarity = max(candidates, key=lambda item: item[1])
+        if similarity >= config.min2_min_similarity:
+            matches.add(neighbor_id)
+    return updated
+
+
 def true_matches_from_labels(frame: pd.DataFrame) -> dict[str, set[str]]:
     validate_columns(frame, {"posting_id", "label_group"}, Path("train_csv"))
     groups = frame.groupby("label_group")["posting_id"].apply(lambda values: set(values.astype(str)))
@@ -585,12 +675,15 @@ def main() -> None:
             diagnostic_frame = train.sample(config.diagnostics_limit, random_state=config.seed)
         else:
             diagnostic_frame = train
+        train_title_matches, train_title_best = title_neighbor_matches_with_best(diagnostic_frame, config)
+        train_word_best: dict[str, tuple[str, float]] = {}
         train_match_maps = [
             exact_phash_matches(diagnostic_frame),
-            title_neighbor_matches(diagnostic_frame, config),
+            train_title_matches,
         ]
         if config.use_word_title:
-            train_match_maps.append(word_title_neighbor_matches(diagnostic_frame, config))
+            train_word_matches, train_word_best = word_title_neighbor_matches_with_best(diagnostic_frame, config)
+            train_match_maps.append(train_word_matches)
         if config.use_image_embeddings:
             train_match_maps.append(image_neighbor_matches(diagnostic_frame, train_image_dir, config))
         if config.use_pretrained_image_embeddings:
@@ -603,6 +696,12 @@ def main() -> None:
                 )
             )
         train_predictions = combine_matches(*train_match_maps)
+        train_predictions = apply_min2_fallback(
+            train_predictions,
+            config,
+            train_title_best,
+            train_word_best,
+        )
         train_metrics = evaluate_matches(diagnostic_frame, train_predictions)
     else:
         diagnostic_frame = train.iloc[0:0]
@@ -614,12 +713,15 @@ def main() -> None:
             f"mean_match_count={train_metrics['mean_match_count']:.2f}"
         )
 
+    test_title_matches, test_title_best = title_neighbor_matches_with_best(test, config)
+    test_word_best: dict[str, tuple[str, float]] = {}
     test_match_maps = [
         exact_phash_matches(test),
-        title_neighbor_matches(test, config),
+        test_title_matches,
     ]
     if config.use_word_title:
-        test_match_maps.append(word_title_neighbor_matches(test, config))
+        test_word_matches, test_word_best = word_title_neighbor_matches_with_best(test, config)
+        test_match_maps.append(test_word_matches)
     if config.use_image_embeddings:
         test_match_maps.append(image_neighbor_matches(test, test_image_dir, config))
     if config.use_pretrained_image_embeddings:
@@ -632,6 +734,12 @@ def main() -> None:
             )
         )
     test_predictions = combine_matches(*test_match_maps)
+    test_predictions = apply_min2_fallback(
+        test_predictions,
+        config,
+        test_title_best,
+        test_word_best,
+    )
     submission = format_submission(test, test_predictions)
     submission.to_csv(output_path, index=False)
     print(f"Wrote submission to {output_path}")

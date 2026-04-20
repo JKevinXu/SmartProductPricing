@@ -21,6 +21,8 @@ MAX_CHAR_FEATURES = 100000
 MAX_WORD_FEATURES = 100000
 MAX_CHAR_TITLE_NEIGHBORS = 80
 MAX_WORD_TITLE_NEIGHBORS = 80
+USE_MIN2_FALLBACK = False
+MIN2_MIN_SIMILARITY = 0.0
 USE_PRETRAINED_IMAGE_EMBEDDINGS = False
 PRETRAINED_MODEL = "clip_vit_b32"
 PRETRAINED_IMAGE_THRESHOLD = 0.75
@@ -91,6 +93,26 @@ def tfidf_neighbor_matches(
     max_features: int,
     max_neighbors: int,
 ) -> dict[str, set[str]]:
+    matches, _ = tfidf_neighbor_matches_with_best(
+        frame,
+        analyzer=analyzer,
+        ngram_range=ngram_range,
+        threshold=threshold,
+        max_features=max_features,
+        max_neighbors=max_neighbors,
+    )
+    return matches
+
+
+def tfidf_neighbor_matches_with_best(
+    frame: pd.DataFrame,
+    *,
+    analyzer: str,
+    ngram_range: tuple[int, int],
+    threshold: float,
+    max_features: int,
+    max_neighbors: int,
+) -> tuple[dict[str, set[str]], dict[str, tuple[str, float]]]:
     titles = normalize_titles(frame["title"])
     vectorizer_args = {
         "analyzer": analyzer,
@@ -119,14 +141,18 @@ def tfidf_neighbor_matches(
 
     posting_ids = frame["posting_id"].astype(str).to_numpy()
     matches: dict[str, set[str]] = {}
+    best_neighbors: dict[str, tuple[str, float]] = {}
     for row_index, posting_id in enumerate(posting_ids):
         row_matches = {posting_id}
         similarities = 1.0 - distances[row_index]
         for similarity, neighbor_index in zip(similarities, indices[row_index], strict=False):
+            neighbor_id = str(posting_ids[neighbor_index])
+            if neighbor_index != row_index and str(posting_id) not in best_neighbors:
+                best_neighbors[str(posting_id)] = (neighbor_id, float(similarity))
             if similarity >= threshold:
-                row_matches.add(str(posting_ids[neighbor_index]))
+                row_matches.add(neighbor_id)
         matches[str(posting_id)] = row_matches
-    return matches
+    return matches, best_neighbors
 
 
 def char_title_matches(frame: pd.DataFrame) -> dict[str, set[str]]:
@@ -142,6 +168,32 @@ def char_title_matches(frame: pd.DataFrame) -> dict[str, set[str]]:
 
 def word_title_matches(frame: pd.DataFrame) -> dict[str, set[str]]:
     return tfidf_neighbor_matches(
+        frame,
+        analyzer="word",
+        ngram_range=(1, 2),
+        threshold=WORD_TITLE_THRESHOLD,
+        max_features=MAX_WORD_FEATURES,
+        max_neighbors=MAX_WORD_TITLE_NEIGHBORS,
+    )
+
+
+def char_title_matches_with_best(
+    frame: pd.DataFrame,
+) -> tuple[dict[str, set[str]], dict[str, tuple[str, float]]]:
+    return tfidf_neighbor_matches_with_best(
+        frame,
+        analyzer="char_wb",
+        ngram_range=(3, 5),
+        threshold=CHAR_TITLE_THRESHOLD,
+        max_features=MAX_CHAR_FEATURES,
+        max_neighbors=MAX_CHAR_TITLE_NEIGHBORS,
+    )
+
+
+def word_title_matches_with_best(
+    frame: pd.DataFrame,
+) -> tuple[dict[str, set[str]], dict[str, tuple[str, float]]]:
+    return tfidf_neighbor_matches_with_best(
         frame,
         analyzer="word",
         ngram_range=(1, 2),
@@ -620,6 +672,32 @@ def combine_matches(*match_maps: dict[str, set[str]]) -> dict[str, set[str]]:
     return combined
 
 
+def apply_min2_fallback(
+    predictions: dict[str, set[str]],
+    *best_neighbor_maps: dict[str, tuple[str, float]],
+) -> dict[str, set[str]]:
+    if not USE_MIN2_FALLBACK:
+        return predictions
+
+    updated = {posting_id: set(matches) for posting_id, matches in predictions.items()}
+    for posting_id, matches in updated.items():
+        if len(matches) > 1:
+            continue
+
+        candidates = [
+            neighbor
+            for best_neighbors in best_neighbor_maps
+            if (neighbor := best_neighbors.get(posting_id)) is not None
+        ]
+        if not candidates:
+            continue
+
+        neighbor_id, similarity = max(candidates, key=lambda item: item[1])
+        if similarity >= MIN2_MIN_SIMILARITY:
+            matches.add(neighbor_id)
+    return updated
+
+
 def find_test_csv() -> Path | None:
     candidates = []
     for root in [KAGGLE_INPUT_DIR, Path("/kaggle/input"), LOCAL_INPUT_DIR]:
@@ -670,12 +748,15 @@ def main() -> None:
         train = pd.read_csv(train_path)
         predictions = reranked_predictions(train, test)
     else:
+        char_matches, char_best_neighbors = char_title_matches_with_best(test)
+        word_matches, word_best_neighbors = word_title_matches_with_best(test)
         predictions = combine_matches(
             exact_phash_matches(test),
-            char_title_matches(test),
-            word_title_matches(test),
+            char_matches,
+            word_matches,
             pretrained_image_matches(test, image_dir, weights_path),
         )
+        predictions = apply_min2_fallback(predictions, char_best_neighbors, word_best_neighbors)
     submission = pd.DataFrame(
         {
             "posting_id": test["posting_id"].astype(str),

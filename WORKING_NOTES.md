@@ -108,7 +108,25 @@ This branch catches near-duplicate titles where whole-word overlap is strong
 but character n-gram similarity misses the row. On two 8k-row train samples,
 the gain was small but positive.
 
-### 4. Lightweight image embeddings
+### 4. Optional min2 singleton fallback
+
+Published solution notes repeatedly mention a simple post-processing trick:
+if a row still only predicts itself after the high-confidence match union, add
+its nearest title neighbor anyway. The intuition is that Shopee duplicate
+groups usually have at least two products, so a singleton prediction is often
+under-recalling.
+
+The experiment applies this only after the safe union baseline. It does not
+make the edge symmetric; it only adds the best character/word TF-IDF nearest
+neighbor to rows that would otherwise submit a one-item match list.
+
+Local diagnostics rejected it as a default setting. On the same 8k train-label
+sample, the current baseline scored `0.84605` mean F1 with `1.61` average
+matches. Unconditional min2 fell to `0.71980` mean F1 with `2.26` average
+matches. Threshold tuning from `0.20` to `0.90` never beat the baseline; at
+`0.80+` it became effectively a no-op.
+
+### 5. Lightweight image embeddings
 
 The image embedding is self-contained and does not use pretrained model
 weights. Each product image is converted into a compact vector:
@@ -310,3 +328,35 @@ status:      COMPLETE
 publicScore: 0.660
 privateScore: 0.648
 ```
+
+## Min2 Fallback Experiment
+
+Kernel version 9 added the singleton min2 fallback from published solution
+writeups, but it failed the local acceptance check and should not be submitted.
+
+```text
+description: phash char word tfidf plus min2 fallback
+status:      REJECTED LOCALLY; NOT SUBMITTED
+change:      exact pHash + char TF-IDF + word TF-IDF, then nearest title
+             neighbor for rows whose combined prediction is still singleton
+```
+
+Local threshold grid on the 8k-row sample:
+
+```text
+threshold  mean_f1  mean_match_count
+off        0.84605  1.61
+0.00       0.71980  2.26
+0.20       0.72320  2.25
+0.30       0.74274  2.19
+0.40       0.77838  2.06
+0.50       0.81496  1.91
+0.60       0.83901  1.76
+0.70       0.84521  1.63
+0.80       0.84605  1.61
+0.90       0.84605  1.61
+```
+
+Kernel version 10 was pushed after the local rejection with `USE_MIN2_FALLBACK`
+set back to `False`, preserving the current safe Kaggle behavior while keeping
+the optional experiment available in code.
